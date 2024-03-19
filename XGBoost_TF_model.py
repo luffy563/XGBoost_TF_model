@@ -12,12 +12,16 @@ import argparse
 import time
 import pandas as pd
 import os
+from bayes_opt.logger import JSONLogger
+from bayes_opt.event import Events
+
 
 ####
 parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
 parser.add_argument("-i","--input", help="Required. the path for normalized value of all gene expression data")
 parser.add_argument("--config",default=None, help="Optional. the path for config to optimize hyper-parameters\n"
                                                   "This option is only used for bayes hyper-parameters optimization, so do not use it for training!!!")
+parser.add_argument("--optim_log",default="./log.txt", help="Optional. the path for logging the info process to optimize hyper-parameters\n")
 
 parser.add_argument("-t","--tf", help="Required. the path for normalized value of TF expression data or a TF list")
 parser.add_argument("-g","--genes", default=None,help="Optional. a gene list with comma separated or a list file")
@@ -114,7 +118,7 @@ def remove_null_key(hyperparameters):
         del hyperparameters[key]
     return hyperparameters
 
-def model_train_each(id,config_file,gene,real_tf_list,n_estimators,X_train,Y_train,X_test,Y_test,
+def model_train_each(id,config_file,optim_log,gene,real_tf_list,n_estimators,X_train,Y_train,X_test,Y_test,
                      subsample,colsample_bytree,gamma,learning_rate,max_depth,early_stopping_rounds,
                     reg_alpha,reg_lambda,random_state,
                     save_model,model_path,model_para_path,temp_dir,
@@ -129,31 +133,35 @@ def model_train_each(id,config_file,gene,real_tf_list,n_estimators,X_train,Y_tra
     early_stop = xgboost.callback.EarlyStopping(rounds=early_stopping_rounds)
 
     # 定义XGBoost回归模型参数的搜索空间
-    def objective(learning_rate,max_depth,gamma,reg_alpha,reg_lambda):
+    def objective(learning_rate,max_depth,gamma,reg_alpha,reg_lambda,subsample):
         params_opt = {
             'max_depth': int(max_depth),
             'learning_rate': learning_rate,
             'n_estimators': int(n_estimators),
             'gamma': gamma,
-            'reg_alpha':reg_alpha,
-            'reg_lambda':reg_lambda,
+            'reg_alpha': reg_alpha,
+            'reg_lambda': reg_lambda,
             'subsample': subsample,
             'colsample_bytree': colsample_bytree
         }
 
-        model = xgboost.XGBRegressor(objective='reg:squarederror', **params_opt)
-        score = cross_val_score(model, X_train, Y_train, scoring='neg_mean_squared_error', cv=5).mean()  # 5折交叉验证
+        model = XGBRegressor(objective='reg:squarederror', **params_opt)
+        score = cross_val_score(model, X_train, Y_train, scoring='r2', cv=5).mean()  # 5折交叉验证
+        # score = model.score(X_test, Y_test)
         return score  # 贝叶斯优化最小化目标函数，因此返回负MSE得分
     # 进行贝叶斯优化
     # result = gp_minimize(objective, space, n_calls=50)  # 调整n_calls参数控制搜索次数
 
     ## read config file
     if config_file:
+        logger = JSONLogger(path=optim_log)
+
 
         param_dict = remove_null_key(read_config_file(config_file))
         rf_bo = BayesianOptimization(
             f=objective,
             pbounds=param_dict)
+        rf_bo.subscribe(Events.OPTIMIZATION_STEP, logger)
         rf_bo.maximize()
         # 输出最优参数
         # best_params = {k: v for k, v in result.x.items()}
@@ -185,8 +193,8 @@ def model_train_each(id,config_file,gene,real_tf_list,n_estimators,X_train,Y_tra
                           random_state=random_state,
                           device=device)
         xgb.fit(X_train,Y_train,eval_set=[(X_test, Y_test)],callbacks=[early_stop],verbose=verbose)
-        fprint(xgb.score(X_train, Y_train))
-        fprint(xgb.score(X_test,Y_test))
+        fprint("Training score: {}".format(xgb.score(X_train, Y_train)))
+        fprint("Test score: {}".format(xgb.score(X_test,Y_test)))
         fprint("Done for training XGBoost model!")
         if save_model:
             fprint("Starting to save XGBoost model...")
@@ -256,7 +264,7 @@ def check_dir(directory):
     if not os.path.exists(directory):
         os.makedirs(directory)
 
-def main(input_file, config_file, tf, genes, log2, test_size,save_model,model_dir,model_name_prefix,
+def main(input_file, config_file,optim_log, tf, genes, log2, test_size,save_model,model_dir,model_name_prefix,
          output,n_estimators,subsample,colsample_bytree,gamma,
          learning_rate,max_depth,early_stopping_rounds,reg_alpha,reg_lambda,random_state,
          threads,device,verbose=False):
@@ -338,7 +346,7 @@ def main(input_file, config_file, tf, genes, log2, test_size,save_model,model_di
         y_each_gene = np.array(dataset_sample_Y.loc[dataset_sample_Y.loc[:,"gene"]==gene, inter_sample_list]).reshape(len(inter_sample_list),-1)
         X_train, X_test, Y_train, Y_test = train_test_split(X_each_gene,y_each_gene,test_size=test_size,random_state=random_state)
         # print(X_train[0,0])
-        model_train_each(i,config_file,gene,real_tf_list,n_estimators,X_train,Y_train,X_test,Y_test,
+        model_train_each(i,config_file,optim_log,gene,real_tf_list,n_estimators,X_train,Y_train,X_test,Y_test,
                          subsample, colsample_bytree,gamma, learning_rate, max_depth,early_stopping_rounds,
                          reg_alpha, reg_lambda,random_state,
                          save_model,model_path,model_para_path, temp_dir, threads,device)
@@ -399,6 +407,7 @@ def combine_all_temp_output(output_file,temp_output_dir,temp_output_pattern,verb
 if __name__ == '__main__':
     input_file, tf, test_size,model_dir,model_name_prefix = args.input, args.tf, args.test_size, args.model_dir,args.model_name_prefix
     config_file = args.config
+    optim_log = args.optim_log
     log2 = args.log2
     genes = args.genes
     output,n_estimators,learning_rate,max_depth = args.output,args.n_estimators,args.learning_rate,args.max_depth
@@ -410,28 +419,6 @@ if __name__ == '__main__':
     threads = args.threads
     device = args.device
     verbose = args.verbose
-    main(input_file,config_file, tf,genes, log2, test_size,save_model,model_dir,model_name_prefix,
+    main(input_file,config_file,optim_log, tf,genes, log2, test_size,save_model,model_dir,model_name_prefix,
          output,n_estimators,subsample,colsample_bytree,gamma,learning_rate,max_depth,early_stopping_rounds,reg_alpha,reg_lambda,random_state,
          threads,device,verbose)
-    ####
-    # data = load_diabetes()
-    # # print(data['target'])
-    # # print(data.keys())  # 查看键(属性)     ['data','target','feature_names','DESCR', 'filename']
-    # # print(data.data.shape, data.target.shape)  # 查看数据的形状 (506, 13) (506,)
-    # # print(data.target)
-    # # print(data.feature_names)  # 查看有哪些特征 这里共13种
-    # # print(data.DESCR)  # described 描述这个数据集的信息
-    # # print(data.filename)  # 文件路径
-    # X_train, X_test, y_train, y_test = train_test_split(data['data'], data['target'], test_size=.2)
-    # # create model instance
-    # bst = XGBRegressor(n_estimators=1000,
-    #     learning_rate=0.08,
-    #     subsample=0.75,
-    #     colsample_bytree=1,
-    #     max_depth=7,
-    #     gamma=0,device="cuda")
-    # # fit model
-    # bst.fit(X_train, y_train)
-    # # make predictions
-    # preds = bst.predict(X_test)
-    # print(preds)
